@@ -24,7 +24,8 @@ paths:
   among ALL S1s whose capped candidates include the pool row. No raw counts (train has ~20%
   more S1s per pool row than test).
 - Extras: name-token IDF containment; log1p count of pool rows sharing the exact `name_s`
-  (pool name and S1 name; EDA-14 duplicated names); `cand_pos`; `emb_cos` when the optional
+  (pool name and S1 name; EDA-14 duplicated names); `cand_pos`; `from_ns` (1 if the pair
+  came from the number-street slots, whose view scores are null); `emb_cos` when the optional
   embedding stage is on.
 - Scope: S2's `queries.parquet` labelled with split (train/early_stop/val/holdout; test),
   `--limit-s1` samples per split; saved as `s1_scope.parquet` (S4's denominators).

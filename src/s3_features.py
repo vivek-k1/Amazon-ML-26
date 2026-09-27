@@ -146,6 +146,8 @@ def pair_features(d: pl.DataFrame, views, idf_a, idf_n, nw, addr_partial: bool, 
     F["n_views"] = pl.sum_horizontal([pl.col(f"rank_{v}").is_not_null() for v in views]).cast(pl.Float32)
     F["n_cands"] = pl.len().over("s1_row").cast(pl.Float32)
     F["cand_pos"] = pl.col("cand_pos").cast(pl.Float32)
+    if "ns" in d.columns:        # 1 = number-street slot (null view scores); 0 = lexical
+        F["from_ns"] = pl.col("ns").cast(pl.Float32)
     # set features
     d = d.with_columns(pl.col("a_tids").list.set_intersection(pl.col("a_tids_p")).alias("_ash"),
                        pl.col("n_tids").list.set_intersection(pl.col("n_tids_p")).alias("_nsh"),

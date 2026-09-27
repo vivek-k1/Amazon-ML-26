@@ -14,8 +14,19 @@ split:
 chunk_s1: 100000            # S1 rows per country chunk (memory bound)
 
 blocking:
-  max_candidates: 50        # applied in S3 (not part of S2's hash)
-  store_candidates: 80      # S2 parts keep the ordered union up to this (cand_pos), reusable by run 2
+  # 50 lexical + 12 number-street slots. The lexical top 50 are unchanged; S3 scores the extra
+  # slots too. Oracle at cap 80 was only +.0009 because the misses are not at rank 51-80 —
+  # name collisions fill the list first (EDA-14: 3,283/4,591 misses share >= 3 address tokens).
+  max_candidates: 62        # applied in S3 (not part of S2's hash); must be >= primary_keep + reserve
+  store_candidates: 92      # 80 lexical + 12 reserved (the lexical tail is shifted, not dropped)
+  num_street:
+    enabled: true
+    primary_keep: 50        # lexical candidates that stay at cand_pos 0..49
+    reserve: 12             # slots at cand_pos 50..61
+    sibling_top1: 4         # of those 12, filled from the top lexical hit's address (sibling records)
+    max_df: 8000            # house numbers more common than this are not indexed
+    min_df: 2               # df 1 already ranks at the top of the IDF views
+    min_street: 1           # shared content street tokens required (street types and RG* excluded)
   views:   # EDA-14 (50K VAL slice): W_all 40 + C_all 40 -> recall 0.9716 at 49.7 cands/S1
     W_all:  {enabled: true, k: 40, skip_cap_frac: 0.01}               # name + address tokens in one vector
     C_all:  {enabled: true, k: 40, skip_cap_frac: 0.005, ngram: 3}    # name-skeleton 3-grams + address tokens

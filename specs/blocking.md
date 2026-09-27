@@ -30,6 +30,12 @@ The cost is the sum of postings, in compiled code.
   score) and stored up to `store_candidates` with `cand_pos`. S3 applies `max_candidates`, so
   it is not part of S2's hash and run 2 can change it without re-blocking. Keep each view's
   score and rank (they become S3 features).
+- `num_street` (when enabled) appends up to `reserve` extra pairs per S1 that share a
+  house number with df in `[min_df, max_df]` and a content street token, either with the S1
+  or with its top lexical hit. They occupy cand_pos `[primary_keep, primary_keep+reserve)`
+  and the lexical tail shifts up, so the lexical top `primary_keep` is unchanged. The join
+  is df-capped and batched (a batch over 5M postings keeps only each S1's rarest number);
+  it is not an uncapped token join. View scores on these rows are null; `ns=1`.
 - Train (no limit) blocks ALL train S1s, not only the split ids: reverse-competition features
   need every S1's candidates, and run 2 can grow the train set without re-blocking. The
   `--limit-s1` train mode stays the VAL-only tuning slice (EDA-14).

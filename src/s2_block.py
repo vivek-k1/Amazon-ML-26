@@ -5,6 +5,13 @@ Per country partition: pool = S2+S3 rows, queries = S1 rows. Each view is a bina
 IDF-weighted, L2-normalized sparse matrix; top-k per view by sparse_dot_topn; candidates are
 the union of the views, ordered and capped at blocking.store_candidates (cand_pos kept;
 S3 applies max_candidates, so run 2 can change it without re-blocking).
+
+Number-street channel (blocking.num_street): EDA-14 misses are mostly a typo'd or
+transliterated name with a shared address, and name collisions fill the top 50 before that
+address match is reached (cap 80 recovers only +.0009 oracle). Extra slots, placed after
+primary_keep so the current top 50 are never dropped, hold pool rows that share a mid-frequency
+house number and a content street token with the S1 — or with the S1's top lexical hit, which
+catches sibling records once one match was found.
 """
 
 import argparse
@@ -102,6 +109,116 @@ def order_and_cap(wide: pl.DataFrame, views, max_c: int) -> pl.DataFrame:
                 .filter(pl.col("_pos") < max_c))
 
 
+# Street-type words. Directions and city names stay: with a mid-frequency house number they
+# are real evidence. Region codes (RG*) are the France fold from S0 and are not a street.
+NS_STOP = ["ROAD", "STREET", "LANE", "AVENUE", "BOULEVARD", "DRIVE", "PLACE", "COURT",
+           "SQUARE", "ROUTE", "CHEMIN", "QUAI", "COURS", "ALLEE", "IMPASSE", "FAUBOURG",
+           "NAGAR", "MARG", "COLONY", "LAYOUT", "CROSS", "BLOCK", "SECTOR", "PHASE",
+           "FLOOR", "HOUSE", "BUILDING", "COMPLEX", "MARKET", "GANJ", "PETH", "PLOT",
+           "FLAT", "SUITE", "UNIT", "NEAR", "OPPOSITE", "BEHIND", "BESIDE"]
+
+
+def _street_list():
+    e = pl.element()
+    return (pl.col("addr_n").fill_null("").str.split(" ")
+            .list.eval(e.filter((e.str.len_chars() >= 4) & ~e.is_in(NS_STOP) & ~e.str.starts_with("RG"))))
+
+
+def build_num_street(pc: pl.DataFrame, ns: dict):
+    """Postings for house numbers with df in [min_df, max_df], plus content street tokens of
+    those pool rows. df 1 already wins the IDF views; very common numbers would be a token join
+    of the kind EDA-11 forbids, so they are not indexed."""
+    nums = (pc.select("pool_row", pl.col("addr_nums").alias("num")).explode("num")
+              .filter(pl.col("num").is_not_null() & (pl.col("num") != "")).unique())
+    nums = nums.join(nums.group_by("num").len("df"), on="num").filter(
+        pl.col("df").is_between(ns["min_df"], ns["max_df"]))
+    st = (pc.select("pool_row", _street_list().alias("tok")).explode("tok")
+            .filter(pl.col("tok").is_not_null() & (pl.col("tok") != "")).unique()
+            .join(nums.select("pool_row").unique(), on="pool_row"))
+    return nums.select("num", "pool_row", "df"), st
+
+
+def _take(d: pl.DataFrame, k: int) -> pl.DataFrame:
+    if d.height == 0 or k <= 0:
+        return d.clear()
+    return (d.sort(["s1_row", "ns_shared", "tok_len", "pool_row"],
+                   descending=[False, True, True, False])
+             .with_columns(pl.int_range(pl.len()).over("s1_row").alias("_r"))
+             .filter(pl.col("_r") < k))
+
+
+def num_street_hits(q: pl.DataFrame, pool_nums: pl.DataFrame, pool_st: pl.DataFrame,
+                    keep: int, min_street: int, batch: int = 2000) -> pl.DataFrame:
+    """Up to `keep` pool rows per S1 sharing one indexed house number and >= min_street content
+    street tokens. Batched, and a batch whose postings exceed 5M rows falls back to each S1's
+    rarest number, so this cannot become the uncapped token join EDA-11 measured."""
+    schema = {"s1_row": q.schema["s1_row"], "pool_row": pool_nums.schema["pool_row"],
+              "ns_shared": pl.UInt32, "tok_len": pl.UInt32, "_r": pl.UInt32}
+    if q.height == 0 or pool_nums.height == 0 or keep <= 0:
+        return pl.DataFrame(schema=schema)
+    df_of = pool_nums.select("num", "df").unique()
+    out = []
+    for off in range(0, q.height, batch):
+        qb = q.slice(off, batch)
+        qn = (qb.select("s1_row", pl.col("addr_nums").alias("num")).explode("num")
+                .filter(pl.col("num").is_not_null() & (pl.col("num") != "")).unique())
+        qn = qn.join(df_of, on="num")
+        if qn.height == 0:
+            continue
+        if int(qn["df"].sum()) > 5_000_000:          # rarest number only: bounds the posting join
+            qn = qn.sort(["s1_row", "df", "num"]).unique("s1_row", keep="first")
+        hits = qn.select("s1_row", "num").join(pool_nums.select("num", "pool_row"), on="num")
+        qs = (qb.select("s1_row", _street_list().alias("tok")).explode("tok")
+                .filter(pl.col("tok").is_not_null() & (pl.col("tok") != "")).unique())
+        if qs.height == 0 or hits.height == 0:
+            continue
+        ps = pool_st.join(hits.select("pool_row").unique(), on="pool_row")
+        sh = (hits.select("s1_row", "pool_row").unique().join(qs, on="s1_row").join(ps, on=["pool_row", "tok"])
+                  .group_by("s1_row", "pool_row")
+                  .agg(pl.col("tok").n_unique().cast(pl.UInt32).alias("ns_shared"),
+                       pl.col("tok").str.len_chars().sum().cast(pl.UInt32).alias("tok_len"))
+                  .filter(pl.col("ns_shared") >= min_street))
+        if sh.height:
+            out.append(_take(sh, keep))
+    return pl.concat(out) if out else pl.DataFrame(schema=schema)
+
+
+def attach_num_street(capped, q, pc, index, views, ns):
+    """Insert up to `reserve` number-street hits at cand_pos [primary_keep, primary_keep+reserve).
+    The lexical top `primary_keep` are left where they are; the lexical tail shifts up by `reserve`
+    so S3's max_candidates keeps the new rows and still drops that tail."""
+    primary_keep, reserve = ns["primary_keep"], ns["reserve"]
+    n_sib = min(int(ns.get("sibling_top1") or 0), reserve)
+    n_q = reserve - n_sib
+    pool_nums, pool_st = index
+    ban = capped.filter(pl.col("cand_pos") < primary_keep).select("s1_row", "pool_row")
+    extra = num_street_hits(q.select("s1_row", "addr_n", "addr_nums"), pool_nums, pool_st,
+                            n_q * 5, ns["min_street"]).join(ban, on=["s1_row", "pool_row"], how="anti")
+    extra = _take(extra, n_q).with_columns((pl.lit(primary_keep) + pl.col("_r")).alias("cand_pos"))
+    if n_sib:
+        top1 = capped.filter(pl.col("cand_pos") == 0).select("s1_row", pl.col("pool_row").alias("src"))
+        q2 = top1.join(pc.select(pl.col("pool_row").alias("src"), "addr_n", "addr_nums"), on="src")
+        sib = num_street_hits(q2.select("s1_row", "addr_n", "addr_nums"), pool_nums, pool_st,
+                              n_sib * 5, ns["min_street"])
+        sib_ban = pl.concat([ban, extra.select("s1_row", "pool_row"),
+                             top1.select("s1_row", pl.col("src").alias("pool_row"))]).unique()
+        sib = _take(sib.join(sib_ban, on=["s1_row", "pool_row"], how="anti"), n_sib)
+        sib = sib.with_columns((pl.lit(primary_keep + n_q) + pl.col("_r")).alias("cand_pos"))
+        extra = pl.concat([extra, sib], how="diagonal_relaxed")
+    head = capped.filter(pl.col("cand_pos") < primary_keep).with_columns(pl.lit(0, pl.Int8).alias("ns"))
+    tail = (capped.filter(pl.col("cand_pos") >= primary_keep)
+                 .with_columns((pl.col("cand_pos") + reserve).cast(pl.Int16).alias("cand_pos"),
+                               pl.lit(0, pl.Int8).alias("ns")))
+    if extra.height == 0:
+        return pl.concat([head, tail], how="diagonal_relaxed"), 0
+    add = extra.select(
+        "s1_row", "pool_row", pl.col("cand_pos").cast(pl.Int16),
+        *[pl.lit(None, dtype=pl.Float32).alias(f"score_{v}") for v in views],
+        *[pl.lit(None, dtype=pl.Int16).alias(f"rank_{v}") for v in views],
+        pl.lit(1, pl.Int8).alias("ns"))
+    return pl.concat([head, add, tail], how="diagonal_relaxed"), add.height
+
+
 def block_chunk(q: pl.DataFrame, pools: dict, views, cfg_views, k_over, nw, max_c, stats):
     q = q.with_columns(pl.int_range(pl.len(), dtype=pl.Int64).alias("idx"))
     s1_rows = q["s1_row"].to_numpy()
@@ -150,7 +267,13 @@ def main(split, limit_s1, force, k_override=None):
     if split == "train" and limit_s1:     # full train blocks every train S1, split-independent
         inputs["s1_gt"] = input_hash("train", "s1_gt")
     # max_candidates is applied in S3 (parts keep store_candidates), so it stays out of the hash;
-    # chunk_s1 decides which S1s land in which part, so it must invalidate parts
+    # chunk_s1 decides which S1s land in which part, so it must invalidate parts.
+    # num_street stays IN the hash: it changes which pairs the parts contain.
+    ns = bc.get("num_street") or {}
+    reserve = int(ns.get("reserve") or 0) if ns.get("enabled") else 0
+    if reserve:
+        assert bc["max_candidates"] >= ns["primary_keep"] + reserve, "max_candidates must keep the reserved slots"
+        assert bc["store_candidates"] - reserve >= ns["primary_keep"], "store_candidates must hold the lexical tail"
     bc_hash = {k: v for k, v in bc.items() if k != "max_candidates"}
     section = {"blocking": bc_hash, "limit_s1": limit_s1, "k_override": k_override,
                "chunk_s1": cfg["chunk_s1"], "seed": cfg["seed"], "code": code_hash("src/s2_block.py")}
@@ -161,7 +284,8 @@ def main(split, limit_s1, force, k_override=None):
         nw, chunk = cfg["n_workers"], cfg["chunk_s1"]
         # uncapped per-view top-k is kept for the tuning eval; the parts hold the capped union
         keep_uncapped = split == "train" and limit_s1 is not None
-        max_c = bc["store_candidates"]
+        # lexical rows stored before the reserved slots are inserted (the tail shifts by `reserve`)
+        max_c = bc["store_candidates"] - reserve
         queries = select_queries(split, limit_s1, cfg["seed"])
         # the exact S1 universe, incl. S1s that get zero candidates (S3/S4 denominators)
         atomic_write_parquet(queries.select("s1_row", "country"), st.work_dir / "queries.parquet")
@@ -191,6 +315,10 @@ def main(split, limit_s1, force, k_override=None):
             stats = {v: {"seconds": 0.0, "postings": 0, "queries": 0} for v in views}
             log.info(f"[{country}] pool {pc.height:,} rows, matrices built in {build_s:.1f}s "
                      f"(vocab {', '.join(f'{v}={pools[v][1].height:,}' for v in views)})")
+            ns_index, ns_added = (build_num_street(pc, ns), 0) if reserve else (None, 0)
+            if reserve:
+                log.info(f"[{country}] number-street index: {ns_index[0].height:,} number postings, "
+                         f"{ns_index[1].height:,} street tokens")
             for i, part in enumerate(parts):
                 if part.exists() and not keep_uncapped:
                     total_rows += pl.scan_parquet(part).select(pl.len()).collect().item()
@@ -203,13 +331,18 @@ def main(split, limit_s1, force, k_override=None):
                 capped = order_and_cap(wide, views, max_c).select(
                     ["s1_row", "pool_row", pl.col("_pos").cast(pl.Int16).alias("cand_pos")]
                     + [f"{m}_{v}" for v in views for m in ("score", "rank")])
+                n_add = 0
+                if reserve:
+                    capped, n_add = attach_num_street(capped, q, pc, ns_index, views, ns)
+                    ns_added += n_add
                 atomic_write_parquet(capped, part)
                 total_rows += capped.height
                 log.info(f"[{country}] chunk {i + 1}/{n_chunks}: {q.height:,} S1 -> "
-                         f"{capped.height:,} pairs ({capped.height / q.height:.1f}/S1) "
-                         f"in {time.time() - t:.1f}s")
+                         f"{capped.height:,} pairs ({capped.height / q.height:.1f}/S1, "
+                         f"+{n_add:,} number-street) in {time.time() - t:.1f}s")
             report["countries"][country] = {
                 "queries": qc.height, "pool": pc.height, "build_seconds": round(build_s, 1),
+                "num_street_added": ns_added,
                 "views": {v: {"seconds": round(s["seconds"], 1), "postings": s["postings"],
                               "postings_per_query": round(s["postings"] / max(s["queries"], 1)),
                               "Mpostings_per_s": round(s["postings"] / max(s["seconds"], 1e-9) / 1e6, 1)}
@@ -223,7 +356,29 @@ def main(split, limit_s1, force, k_override=None):
         if keep_uncapped:
             atomic_write_parquet(pl.concat(uncapped, how="diagonal_relaxed"), ev / "uncapped.parquet")
             atomic_write_parquet(queries.select("s1_row", "country", "name_script"), ev / "queries.parquet")
+            if reserve:
+                _log_slice_recall(st.work_dir, ns["primary_keep"], ns["primary_keep"] + reserve)
         st.rows = total_rows
+
+
+def _log_slice_recall(work, primary_keep, cap):
+    """On the tuning slice only: recall of the lexical top vs the same list plus reserved slots.
+    The first number must match the previous run; the difference is the pairs this channel adds."""
+    gt_path = Path("work/train/s1_gt/gt_pairs.parquet")
+    parts = sorted(Path(work).glob("part-*.parquet"))
+    if not gt_path.exists() or not parts:
+        return
+    q = pl.read_parquet(Path(work) / "queries.parquet").select("s1_row")
+    gt = pl.read_parquet(gt_path, columns=["s1_row", "pool_row"]).join(q, on="s1_row")
+    c = (pl.concat([pl.read_parquet(p, columns=["s1_row", "pool_row", "cand_pos"]) for p in parts])
+           .group_by("s1_row", "pool_row").agg(pl.col("cand_pos").min()))  # tail + slot would double-count
+    pos = gt.join(c, on=["s1_row", "pool_row"], how="left")["cand_pos"]
+    n = gt.height
+    primary = int((pos < primary_keep).fill_null(False).sum())
+    both = int((pos < cap).fill_null(False).sum())
+    log.info(f"slice recall: lexical top {primary_keep} = {primary / n:.4f} ({primary}/{n}); "
+             f"plus number-street cand_pos<{cap} = {both / n:.4f} ({both}/{n}); "
+             f"rescued {both - primary}")
 
 
 if __name__ == "__main__":

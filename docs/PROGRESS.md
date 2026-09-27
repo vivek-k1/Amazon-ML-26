@@ -10,7 +10,19 @@
 6. Run 2: resume from run-1 checkpoints (≤ 4 h) → gate → submission 2 only if > 2 paired SE better on HOLDOUT.
 7. `/package <team>` final zip.
 
-## Status
+## Status (read this first)
+- **0.99 is the blocking ceiling, not a tuning target.** With the reranker, HOLDOUT loss is .0212 and
+  half of it (.0104) is pairs that are not in the candidate list at all. A perfect matcher on today's
+  candidates scores about **.990** on VAL (India's own oracle is .9827, so a test mix that is 47% India
+  cannot clear .99 even with a perfect matcher unless retrieval gets better). Public LB sits ~.01 below
+  HOLDOUT because France is unseen. **+0.15 is impossible** (the score is already ~.967; the maximum is 1).
+- The +0.002 the user saw is the whole measured gain of the reranker (HOLDOUT +.0024). Every other
+  measured idea left is smaller: stage-2 GBM +.0012 on top of the cross-encoder, cap-80 oracle +.0009,
+  embedding view oracle +.0016.
+- **Next change (coded, not run):** number-street reserved slots in S2. See "Retrieval channel" below.
+  Run the 50K slice first and abort if it does not rescue a meaningful share of the misses.
+
+## History
 - Current step: 4 DONE (2026-09-27 05:41). Run 1 passed the submission gate -> submission-1 candidate in
   submissions/1/ (README has md5s, metrics, France formula). Waiting on: user uploads + reports public LB.
 - Run 1: clean `run_all.sh --force all`, 02:56-05:03 UTC = 2 h 07 min wall (stage sum 125.1 min) vs 8 h.
@@ -123,6 +135,33 @@ rm work/test/s5_infer/_DONE.json && .venv/bin/python src/s5_infer.py --split tes
 Expected: HOLDOUT ≈ .9788 (reranker) ± neutral S0 change; France label-free stats move toward US/India.
 Budget: S0 4.4 + S2 47 + S3 12.5 + S4 4 + S4x ~12 (copy + score 510K band pairs) + S5 ~110 (reranker
 5.5M pairs at 880/s) ≈ 3 h 10. Stale `work/test/s5_scores/<tag>/` dirs are not auto-deleted (≈1 GB each).
+
+## Retrieval channel (coded 2026-09-27, not run)
+`blocking.num_street` in `src/s2_block.py`. The lexical top 50 stay at cand_pos 0..49. Up to 12 extra
+pairs per S1 land at cand_pos 50..61 (8 from the S1's own house number + content street token, 4 from
+the top lexical hit's address, i.e. sibling records). `max_candidates` 62, `store_candidates` 92.
+Street types and `RG*` region codes do not count. Numbers with df outside [2, 8000] are not indexed
+(df 1 already wins IDF; common numbers would be the EDA-11 join). New rows have null view scores and
+`from_ns=1`, so S4 retrains. The reranker is still the copied rr300k weights.
+
+Synthetic check (local, no data): a "162 … BAILLE TOURCOING" query retrieves the pool rows that share
+162 and BAILLE, not the same number on a different street; df caps hold; cand_pos 0..49 is unchanged;
+the sibling of the top hit is added; the top hit is not duplicated.
+
+Abort rule on the 50K slice (`slice recall` log line): lexical top-50 recall must stay ~.9717, and
+`rescued` must be large versus the 4,591 misses on that slice. A few hundred rescued pairs is the
+cap-80 result we already measured (+.0009) — stop and restore the snapshot. Several thousand rescued
+is the only outcome that can move the score by more than the reranker did.
+
+```
+cp -al work work_before_ns          # slice --force wipes work/train/s2_block
+.venv/bin/python src/s2_block.py --split train --limit-s1 50000 --force
+# then, only if rescued is large:
+bash run_all.sh --from s2_block     # S0/S1 reused; S2 hash change reruns S2..S5
+```
+Watch S4x's band-pair count. Run-1 test band was 5.5M pairs / ~104 min at 880/s. If VAL's band is
+several times the old ~0.3M, S5 will not finish in budget: set `band_top_k: 8` and rerun S4x+S5.
+Do not submit unless HOLDOUT beats the reranker run by > 2 paired SE (`tools/per_s1_f.py compare`).
 
 ## Submission log
 | # | Date | Contents | HOLDOUT F ± SE (India / US) | Test sanity (France) | md5 matching | Public LB |
