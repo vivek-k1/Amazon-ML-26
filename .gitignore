@@ -1,0 +1,30 @@
+# environments
+.venv/
+.venv-llm/
+__pycache__/
+*.py[cod]
+.python-version
+
+# data, weights, checkpoints, outputs (never ship)
+data/
+models/
+work/
+output/
+logs/
+notebooks/
+
+# submission TSVs (md5s live in README)
+submissions/**/*.tsv
+*.tsv
+
+# secrets
+.env
+.env.*
+*.pem
+credentials.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
